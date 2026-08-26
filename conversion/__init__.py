@@ -235,6 +235,9 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Qwen3_5ForConditionalGeneration": "qwen",
     "Qwen3_5MoeForCausalLM": "qwen",
     "Qwen3_5MoeForConditionalGeneration": "qwen",
+    "Qwen38GDN64Model": "qwen",
+    "Qwen38GDN64ForCausalLM": "qwen",
+    "Qwen38GDN64VLForConditionalGeneration": "qwen",
     "RND1": "qwen",
     "RWForCausalLM": "falcon",
     "RWKV6Qwen2ForCausalLM": "rwkv",
@@ -275,6 +278,13 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "YoutuVLForConditionalGeneration": "deepseek",
     "modeling_grove_moe.GroveMoeForCausalLM": "grovemoe",
     "modeling_sarvam_moe.SarvamMoEForCausalLM": "bailingmoe",
+}
+
+
+TEXT_MODEL_ALIASES: dict[str, str] = {
+    "Qwen38GDN64Model": "Qwen3_5ForCausalLM",
+    "Qwen38GDN64ForCausalLM": "Qwen3_5ForCausalLM",
+    "Qwen38GDN64VLForConditionalGeneration": "Qwen3_5ForConditionalGeneration",
 }
 
 
@@ -338,7 +348,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "StepVLForConditionalGeneration": "step3",
     "Step3p7ForConditionalGeneration": "step3",
     "UltravoxModel": "ultravox",
-    "UnlimitedOCRForCausalLM": "deepseek",
+    "UnlimitedOCRForConditionalGeneration": "deepseek",
     "VoxtralForConditionalGeneration": "ultravox",
     "YoutuVLForConditionalGeneration": "youtuvl",
 }
@@ -381,7 +391,8 @@ def get_model_class(name: str, mmproj: bool = False) -> Type[ModelBase]:
     module_name = relevant_map[name]
     __import__(f"conversion.{module_name}")
     model_type = ModelType.MMPROJ if mmproj else ModelType.TEXT
-    return ModelBase._model_classes[model_type][name]
+    registry_name = name if mmproj else TEXT_MODEL_ALIASES.get(name, name)
+    return ModelBase._model_classes[model_type][registry_name]
 
 
 def print_registered_models() -> None:

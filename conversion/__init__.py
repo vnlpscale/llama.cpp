@@ -348,7 +348,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
     "StepVLForConditionalGeneration": "step3",
     "Step3p7ForConditionalGeneration": "step3",
     "UltravoxModel": "ultravox",
-    "UnlimitedOCRForConditionalGeneration": "deepseek",
+    "UnlimitedOCRForCausalLM": "deepseek",
     "VoxtralForConditionalGeneration": "ultravox",
     "YoutuVLForConditionalGeneration": "youtuvl",
 }

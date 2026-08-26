@@ -2,8 +2,6 @@ name: Build Actions Cache
 
 on:
   workflow_dispatch: # allows manual triggering
-  schedule:
-    - cron: '0 * * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -34,7 +32,7 @@ jobs:
   #      uses: ./.github/actions/linux-setup-spacemit
   #      with:
   #        path: ./spacemit_toolchain
-  #        version: ${{ env.SPACEMIT_IME_TOOLCHAIN_VERSION }}
+  #        version_major: ${{ env.SPACEMIT_IME_TOOLCHAIN_VERSION }}
 
   ubuntu-24-openvino-cache:
     runs-on: ubuntu-24.04
@@ -111,8 +109,8 @@ jobs:
   #         path: C:\TheRock\build
   #         key: rocm-wheels-${{ env.ROCM_VERSION }}-multi-arch-${{ runner.os }}
 
-  #     - name: Setup ROCm
-  #       if: steps.cache-rocm.outputs.cache-hit != 'true'
-  #       uses: ./.github/actions/windows-setup-rocm
-  #       with:
-  #         version: ${{ env.ROCM_VERSION }}
+  #   - name: Setup ROCm
+  #     if: steps.cache-rocm.outputs.cache-hit != 'true'
+  #     uses: ./.github/actions/windows-setup-rocm
+  #     with:
+  #       version: ${{ env.ROCM_VERSION }}

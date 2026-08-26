@@ -1,0 +1,115 @@
+name: Fork CI/CD
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Create a GitHub Release after CI passes"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: Linux x64 build and test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate Python converter sources
+        run: python3 -m compileall -q conversion convert_hf_to_gguf.py
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_FATAL_WARNINGS=ON \
+            -DGGML_RPC=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DBUILD_SHARED_LIBS=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 2
+
+      - name: Test
+        run: ctest --test-dir build -L main --verbose --timeout 900
+
+      - name: Package release binaries
+        if: >-
+          (github.event_name == 'push' &&
+           github.ref == 'refs/heads/master' &&
+           contains(github.event.head_commit.message, '[release]')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.create_release)
+        run: |
+          mkdir -p package
+          cp LICENSE package/
+          cp -R build/bin/. package/
+          tar -czf llama-cpp-linux-x64.tar.gz -C package .
+
+      - name: Upload release artifact
+        if: >-
+          (github.event_name == 'push' &&
+           github.ref == 'refs/heads/master' &&
+           contains(github.event.head_commit.message, '[release]')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.create_release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-cpp-linux-x64
+          path: llama-cpp-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: ci
+    runs-on: ubuntu-24.04
+    if: >-
+      (github.event_name == 'push' &&
+       github.ref == 'refs/heads/master' &&
+       contains(github.event.head_commit.message, '[release]')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.create_release)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: llama-cpp-linux-x64
+          path: dist
+
+      - name: Determine release tag
+        id: version
+        shell: bash
+        run: |
+          MAJOR=$(grep "set(LLAMA_VERSION_MAJOR" CMakeLists.txt | grep -oP '\d+')
+          MINOR=$(grep "set(LLAMA_VERSION_MINOR" CMakeLists.txt | grep -oP '\d+')
+          PATCH=$(grep "set(LLAMA_VERSION_PATCH" CMakeLists.txt | grep -oP '\d+')
+          TAG="v${MAJOR}.${MINOR}.${PATCH}-vnlpscale.${GITHUB_RUN_NUMBER}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${TAG}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            dist/llama-cpp-linux-x64.tar.gz \
+            --target "$GITHUB_SHA" \
+            --title "llama.cpp fork ${TAG}" \
+            --generate-notes

@@ -1,0 +1,76 @@
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@
+     if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
+         uint32_t full_attn_interval = 4;
+         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
+-            hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
++            if (i >= hparams.n_layer()) {
++                hparams.is_recr_impl[i] = false;
++                continue;
++            }
++
++            const std::string ssm_name = "blk." + std::to_string(i) + ".ssm_conv1d.weight";
++            if (ml.get_weight(ssm_name) != nullptr) {
++                hparams.is_recr_impl[i] = true;
++            } else {
++                hparams.is_recr_impl[i] = ((i + 1) % full_attn_interval != 0);
++            }
+         }
+     }
+@@
+     const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
+     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
+     int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
++    if (hparams.n_layer_nextn > 0) {
++        const std::string mtp_norm = "blk." + std::to_string(hparams.n_layer()) + ".attn_norm.weight";
++        if (ml.get_weight(mtp_norm) == nullptr) {
++            mtp_flags |= TENSOR_NOT_REQUIRED;
++        }
++    }
+@@
+-    ggml_tensor * inp_pos     = build_inp_pos();
++    ggml_tensor * inp_pos = nullptr;
++    for (int il = 0; il < n_layer; ++il) {
++        if (!hparams.is_recr(il)) {
++            inp_pos = build_inp_pos();
++            break;
++        }
++    }
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@
+ void llama_kv_cache::set_input_k_idxs(
+@@
+ {
++    if (layers.empty()) {
++        return;
++    }
+@@
+ void llama_kv_cache::set_input_v_idxs(
+@@
+ {
++    if (layers.empty()) {
++        return;
++    }
+@@
+ void llama_kv_cache::set_input_kq_mask(
+@@
+ {
++    if (layers.empty()) {
++        return;
++    }
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@
+ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
+-    if (ubatch->pos && pos) {
++    if (ubatch->pos && pos && pos->buffer) {
+         const int64_t n_tokens = ubatch->n_tokens;

@@ -1,5 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid.h"
+
+#include <string>
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -16,13 +19,13 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
     GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < n_layer_impl");
 
-    // Mark recurrent layers (linear attention layers). MTP layers are dense
-    // attention-only and must be flagged non-recurrent.
+    // Prefer explicit recurrent-layer metadata. When it is absent, infer the
+    // topology from the tensors themselves instead of assuming a fixed full
+    // attention interval. This also supports all-recurrent Qwen35 derivatives.
     if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
-        uint32_t full_attn_interval = 4;
-        ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
-            hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
+            const std::string ssm_name = "blk." + std::to_string(i) + ".ssm_conv1d.weight";
+            hparams.is_recr_impl[i] = (i < hparams.n_layer()) && (ml.get_weight(ssm_name.c_str()) != nullptr);
         }
     }
 
@@ -123,6 +126,11 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         load_block_trunk(i, trunk_flags);
     }
     for (int i = n_layer; i < n_layer_all; ++i) {
+        const std::string mtp_norm_name = "blk." + std::to_string(i) + ".attn_norm.weight";
+        if (ml.get_weight(mtp_norm_name.c_str()) == nullptr) {
+            LLAMA_LOG_WARN("%s: skipping absent MTP block %d\n", __func__, i);
+            continue;
+        }
         load_block_mtp(i);
     }
 }
@@ -150,9 +158,40 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(inpL, "model.input_embed", -1);
 
-    auto * inp = build_inp_mem_hybrid();
+    bool has_full_attn = false;
+    for (int il = 0; il < n_layer; ++il) {
+        has_full_attn |= !hparams.is_recr(il);
+    }
 
-    ggml_tensor * inp_pos     = build_inp_pos();
+    llm_graph_input_mem_hybrid * inp_hybrid = nullptr;
+    llm_graph_input_rs * inp_recr = nullptr;
+
+    if (has_full_attn) {
+        inp_hybrid = build_inp_mem_hybrid();
+        inp_recr = inp_hybrid->get_recr();
+    } else {
+        // Pure recurrent models do not need attention-cache graph inputs. Building
+        // the hybrid input unconditionally creates dead KV/position inputs with no
+        // backend buffer, which later fail during set_inputs(). Build only the
+        // recurrent-state input in this case.
+        const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(params.mctx);
+        auto inp_rs = std::make_unique<llm_graph_input_rs>(mctx_cur->get_recr());
+
+        const int64_t n_rs   = mctx_cur->get_recr()->get_n_rs();
+        const int64_t n_seqs = ubatch.n_seqs;
+
+        inp_rs->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp_rs->s_copy);
+
+        inp_rs->s_copy_main  = ggml_view_1d(ctx0, inp_rs->s_copy, n_seqs, 0);
+        inp_rs->s_copy_extra = ggml_view_1d(ctx0, inp_rs->s_copy, n_rs - n_seqs, n_seqs * inp_rs->s_copy->nb[0]);
+        inp_rs->head = mctx_cur->get_recr()->get_head();
+        inp_rs->rs_z = mctx_cur->get_recr()->get_rs_z();
+
+        inp_recr = static_cast<llm_graph_input_rs *>(res->add_input(std::move(inp_rs)));
+    }
+
+    ggml_tensor * inp_pos     = has_full_attn ? build_inp_pos() : nullptr;
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
@@ -169,10 +208,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recr(il)) {
             // Linear attention layer (gated delta net)
-            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+            cur = build_layer_attn_linear(inp_recr, cur, il);
         } else {
             // Full attention layer
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+            GGML_ASSERT(inp_hybrid && inp_pos);
+            cur = build_layer_attn(inp_hybrid->get_attn(), cur, inp_pos, sections, il);
         }
 
         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
@@ -537,7 +577,6 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
-
     auto * inp_attn = build_attn_inp_kv();
 
     ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);

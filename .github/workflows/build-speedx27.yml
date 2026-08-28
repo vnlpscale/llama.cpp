@@ -1,0 +1,63 @@
+name: Build SpeedX27 llama.cpp
+
+on:
+  push:
+    branches:
+      - chatgpt/build-speedx27-gdn64
+  workflow_dispatch:
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+
+      - name: Configure Release build
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_SHARED_LIBS=OFF
+          -DLLAMA_BUILD_TESTS=OFF
+          -DLLAMA_BUILD_TOOLS=ON
+          -DLLAMA_BUILD_SERVER=ON
+          -DLLAMA_BUILD_UI=OFF
+
+      - name: Build llama-cli and llama-server
+        run: cmake --build build --target llama-cli llama-server -- -j 2
+
+      - name: Verify binaries
+        run: |
+          ./build/bin/llama-cli --version
+          ./build/bin/llama-server --version
+          file ./build/bin/llama-cli ./build/bin/llama-server
+          ldd ./build/bin/llama-cli || true
+          ldd ./build/bin/llama-server || true
+
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          cp build/bin/llama-cli dist/
+          cp build/bin/llama-server dist/
+          tar -C dist -czf llama-speedx27-linux-x64.tar.gz llama-cli llama-server
+          sha256sum llama-speedx27-linux-x64.tar.gz > llama-speedx27-linux-x64.tar.gz.sha256
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-speedx27-linux-x64
+          path: |
+            llama-speedx27-linux-x64.tar.gz
+            llama-speedx27-linux-x64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7

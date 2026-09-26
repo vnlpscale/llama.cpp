@@ -1,0 +1,72 @@
+name: GDN64 validation
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [codex/gdn64-latest-precision-cuda]
+    paths:
+      - 'src/**'
+      - 'ggml/**'
+      - 'tests/**'
+      - 'scripts/*gdn64*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    name: CPU recurrence and GDN64 graph regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install numpy pyyaml tqdm
+      - name: Build focused tests
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_MTMD=OFF -DGGML_OPENMP=OFF
+          cmake --build build --parallel 2 --target test-backend-ops test-gdn64-model
+      - name: Check reference recurrence, snapshots, model loading, and graph reuse
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q conversion convert_hf_to_gguf.py scripts/bench-gdn64.py scripts/gdn64-model-smoke.py
+          ./build/bin/test-backend-ops test -b CPU -o 'GATED_DELTA_NET.*' | tee gdn64-cpu.log
+          python scripts/gdn64-model-smoke.py --build-dir build 2>&1 | tee gdn64-model.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gdn64-cpu-validation
+          path: gdn64-*.log
+          retention-days: 7
+
+  cuda-compile:
+    name: CUDA 12.8 compile only (no GPU runtime)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - name: Install build prerequisites
+        run: apt-get update && apt-get install -y --no-install-recommends git cmake ninja-build g++ ca-certificates
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Configure and compile changed CUDA translation units
+        shell: bash
+        run: |
+          set -euo pipefail
+          nvcc --version
+          cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DGGML_NATIVE=OFF -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_MTMD=OFF -DLLAMA_BUILD_SERVER=OFF
+          ninja -C build-cuda -v -j2 ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/gated_delta_net.cu.o ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/gated_delta_net_tiled.cu.o 2>&1 | tee gdn64-cuda-compile.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gdn64-cuda-compile-only
+          path: gdn64-cuda-compile.log
+          retention-days: 7

@@ -1,8 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
-#include "llama-memory-hybrid.h"
 
 #include <string>
+#include <stdexcept>
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -15,13 +15,7 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
-    // NextN/MTP (Qwen3.5/3.6): extra decoder block appended beyond the main stack
-    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
-    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < n_layer_impl");
-
-    // Prefer explicit recurrent-layer metadata. When it is absent, infer the
-    // topology from the tensors themselves instead of assuming a fixed full
-    // attention interval. This also supports all-recurrent Qwen35 derivatives.
+    // Prefer explicit metadata, then infer recurrent layers from physical SSM tensors.
     if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
             const std::string ssm_name = "blk." + std::to_string(i) + ".ssm_conv1d.weight";
@@ -128,6 +122,9 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     for (int i = n_layer; i < n_layer_all; ++i) {
         const std::string mtp_norm_name = "blk." + std::to_string(i) + ".attn_norm.weight";
         if (ml.get_weight(mtp_norm_name.c_str()) == nullptr) {
+            if (ml.load_mtp) {
+                throw std::runtime_error("Qwen3.5: requested MTP block is absent: " + mtp_norm_name);
+            }
             LLAMA_LOG_WARN("%s: skipping absent MTP block %d\n", __func__, i);
             continue;
         }
@@ -163,33 +160,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         has_full_attn |= !hparams.is_recr(il);
     }
 
-    llm_graph_input_mem_hybrid * inp_hybrid = nullptr;
-    llm_graph_input_rs * inp_recr = nullptr;
-
-    if (has_full_attn) {
-        inp_hybrid = build_inp_mem_hybrid();
-        inp_recr = inp_hybrid->get_recr();
-    } else {
-        // Pure recurrent models do not need attention-cache graph inputs. Building
-        // the hybrid input unconditionally creates dead KV/position inputs with no
-        // backend buffer, which later fail during set_inputs(). Build only the
-        // recurrent-state input in this case.
-        const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(params.mctx);
-        auto inp_rs = std::make_unique<llm_graph_input_rs>(mctx_cur->get_recr());
-
-        const int64_t n_rs   = mctx_cur->get_recr()->get_n_rs();
-        const int64_t n_seqs = ubatch.n_seqs;
-
-        inp_rs->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
-        ggml_set_input(inp_rs->s_copy);
-
-        inp_rs->s_copy_main  = ggml_view_1d(ctx0, inp_rs->s_copy, n_seqs, 0);
-        inp_rs->s_copy_extra = ggml_view_1d(ctx0, inp_rs->s_copy, n_rs - n_seqs, n_seqs * inp_rs->s_copy->nb[0]);
-        inp_rs->head = mctx_cur->get_recr()->get_head();
-        inp_rs->rs_z = mctx_cur->get_recr()->get_rs_z();
-
-        inp_recr = static_cast<llm_graph_input_rs *>(res->add_input(std::move(inp_rs)));
-    }
+    auto * inp = build_inp_mem_hybrid(has_full_attn);
 
     ggml_tensor * inp_pos     = has_full_attn ? build_inp_pos() : nullptr;
     ggml_tensor * inp_out_ids = build_inp_out_ids();
@@ -208,11 +179,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recr(il)) {
             // Linear attention layer (gated delta net)
-            cur = build_layer_attn_linear(inp_recr, cur, il);
+            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
             // Full attention layer
-            GGML_ASSERT(inp_hybrid && inp_pos);
-            cur = build_layer_attn(inp_hybrid->get_attn(), cur, inp_pos, sections, il);
+            GGML_ASSERT(inp->get_attn() && inp_pos);
+            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
@@ -307,8 +278,14 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
-    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+    auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[il], cur,
+            n_embd_head * 2, n_head,
+            n_embd_head,     n_head_kv,
+            n_embd_head,     n_head_kv,
+            il, false);
     cb(Qcur_full, "Qcur_full", il);
+    cb(Kcur, "Kcur", il);
+    cb(Vcur, "Vcur", il);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
@@ -318,12 +295,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Apply Q normalization
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
-
-    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
-    cb(Kcur, "Kcur", il);
-
-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
-    cb(Vcur, "Vcur", il);
 
     // Apply K normalization
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -467,10 +438,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv", il);
     cb(v_conv, "v_conv", il);
 
+
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
@@ -596,7 +568,11 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
 
-    ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
+    auto [Qcur_full, Kcur, Vcur] = build_qkv(layer, cur,
+            n_embd_head * 2, n_head,
+            n_embd_head,     n_head_kv,
+            n_embd_head,     n_head_kv,
+            il, false);
     cb(Qcur_full, "mtp_Qcur_full", il);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full,
@@ -615,12 +591,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "mtp_gate", il);
 
-    ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "mtp_Kcur_normed", il);
 
-    ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
     cb(Vcur, "mtp_Vcur", il);
 

@@ -1,0 +1,43 @@
+name: Apply reviewed GDN64 integration
+
+on:
+  push:
+    branches: [codex/gdn64-latest-precision-cuda]
+    paths: [patches/gdn64-integration.patch.gz.b64]
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate and apply exact reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream=08618ff8e735141d8e4e5be28e6d6af170e4757b
+          fork=c5709247c243a0b1ae299ddb9d8f4c8b0279be89
+          old_head="$GITHUB_SHA"
+          patch_file="$RUNNER_TEMP/gdn64-reviewed.patch"
+          base64 --decode patches/gdn64-integration.patch.gz.b64 | gzip -d > "$patch_file"
+          printf '%s  %s\n' 3cbd957afdd5537ae07bf041a114cf2ddf793e8373d4890c88032551285ec086 "$patch_file" | sha256sum -c -
+          git fetch --no-tags https://github.com/ggml-org/llama.cpp.git "$upstream"
+          git read-tree --reset -u "$upstream"
+          # Keep this fork's workflow definitions byte-identical to the reviewed branch.
+          git restore --source="$old_head" --staged --worktree -- .github/workflows
+          git restore --source="$fork" --staged --worktree -- AGENTS.md docs/qwen35-speedx27-gdn64.md patches/qwen35-speedx27-gdn64.patch
+          git apply --index "$patch_file"
+          git diff --cached --check
+          git diff --cached --stat
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          tree=$(git write-tree)
+          commit=$(git commit-tree "$tree" -p "$old_head" -p "$upstream" -m 'Merge pinned upstream and add opt-in FP32 tiled GDN kernel with regressions' -m 'Preserve GDN64 compatibility and fork workflows. CPU tests passed locally; GPU runtime performance remains unverified. AI-assisted implementation.')
+          # Fast-forward only: concurrent work must never be overwritten.
+          git push origin "$commit:refs/heads/codex/gdn64-latest-precision-cuda"
+          printf 'Integrated commit: %s\n' "$commit"

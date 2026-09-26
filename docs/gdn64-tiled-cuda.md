@@ -2,10 +2,11 @@
 
 ## Scope and status
 
-This fork integrates upstream `08618ff8e735141d8e4e5be28e6d6af170e4757b`
+This fork integrates upstream `86a24a182bd3c6c877aaf3734d99f9a1820f8cbd`
 with the existing SpeedX27/GDN64 compatibility changes. GDN64 means **64 recurrent
 layers**, not a 64-element head. Existing converter aliases, physical-tensor layer
-inference, and the fork's CI/release policy are retained.
+inference, and the fork's CI/release policy are retained. The initial integration
+used `08618ff8`; the subsequent one-line upstream Jinja build fix is also merged.
 
 The new CUDA path is **opt-in**: `GGML_CUDA_GDN_TILED=1`. It is an optimization
 candidate, not a measured speedup claim. No model weights are requantized. The
@@ -95,9 +96,19 @@ unit-test criterion, not a real-model quality guarantee. Synthetic model tests
 check finite logits, repeated graph reuse, and deterministic state reset; they
 are deliberately untrained and do not measure linguistic quality.
 
-The hosted CUDA validation job compiles the two changed CUDA translation units.
-It has no GPU and is not a runtime or throughput test. Before enabling the path
-by default, run the complete CUDA tests, compute-sanitizer, long-context real-model
-logit/perplexity comparisons, and repeated pp512/tg128 benchmarks with identical
-weights, offload, context, and batch settings. Retain baseline and candidate logs;
-report prompt processing and token generation separately.
+### Recorded checks (2026-09-26)
+
+Local Release CPU compilation and all 57 GDN operation tests passed. Both synthetic
+64-layer fixtures passed model loading, graph reuse, finite-logit and state-reset
+checks. GitHub Actions run `36228882247`, on commit `076f2ac7988e61162b8fc19fb1116e1f6f3bb553`,
+independently passed the same 57 tests and both fixtures, and compiled both changed
+CUDA translation units with CUDA 12.8 for SM86. Its compiler log confirms the tiled
+source's `-ftz=false -prec-div=true -prec-sqrt=true` overrides. The later upstream
+Jinja-only change does not alter these CUDA sources and was also rebuilt locally.
+
+The hosted CUDA validation job has no GPU: compilation is not a runtime or
+throughput test. Before enabling the path by default, run the complete CUDA tests,
+compute-sanitizer, long-context real-model logit/perplexity comparisons, and repeated
+pp512/tg128 benchmarks with identical weights, offload, context, and batch settings.
+Retain baseline and candidate logs; report prompt processing and token generation
+separately. No measured speedup factor or real-model quality guarantee is available.

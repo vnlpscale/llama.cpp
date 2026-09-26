@@ -3,7 +3,7 @@ name: Apply reviewed GDN64 integration
 on:
   push:
     branches: [codex/gdn64-latest-precision-cuda]
-    paths: [patches/gdn64-integration.patch.gz.b64]
+    paths: [patches/gdn64-integration.patch.gz.b64, .github/workflows/gdn64-integrate.yml]
 
 permissions:
   contents: write
@@ -32,7 +32,7 @@ jobs:
           git restore --source="$old_head" --staged --worktree -- .github/workflows
           git restore --source="$fork" --staged --worktree -- AGENTS.md docs/qwen35-speedx27-gdn64.md patches/qwen35-speedx27-gdn64.patch
           git apply --index "$patch_file"
-          git diff --cached --check
+          git diff --cached --check "$upstream"
           git diff --cached --stat
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'

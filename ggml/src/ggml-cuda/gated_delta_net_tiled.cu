@@ -138,6 +138,8 @@ bool ggml_cuda_try_gdn_tiled(const ggml_cuda_gdn_tiled_args & a, int64_t head_si
     // Contiguous rows need not be vector-aligned (e.g. offset views).
     const uintptr_t ptr_bits = reinterpret_cast<uintptr_t>(a.q) | reinterpret_cast<uintptr_t>(a.k) |
                                reinterpret_cast<uintptr_t>(a.state_in) | reinterpret_cast<uintptr_t>(a.state_out);
+    // Every vectorized state and Q/K access must satisfy the corresponding alignment.
+    // Keep the optimized branch disabled for a nonzero Q/K logical-view offset.
     if ((ptr_bits & 15) || ((a.sq1 | a.sq2 | a.sq3 | a.state_slot_stride) & 3)) {
         return false;
     }
